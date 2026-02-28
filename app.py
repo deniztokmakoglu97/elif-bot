@@ -1,7 +1,7 @@
 import streamlit as st
 from db import init_db, load_messages
 from session import get_or_create_session_id, clear_session_id
-from app import chat
+from chat import chat
 
 
 #  ── Streamlit UI ──────────────────────────────────────────────

@@ -3,8 +3,13 @@ import streamlit as st
 from db import save_message
 from tools import FUNCTION_MAP, TOOLS, safe_call
 from config import SYSTEM_PROMPT
+from rag import retrieve
 
 def chat(user_message: str) -> str:
+    context = retrieve(user_message)
+    augmented_SYSTEM = SYSTEM_PROMPT + f"""
+    [Relevant context from Elif and Deniz's chat history:]
+    {context}"""
     st.session_state.history.append(
         {"role": "user", "content": user_message}
         )
@@ -14,12 +19,13 @@ def chat(user_message: str) -> str:
                 content=user_message
                 )   
     
+    
 
     while True:
 
         response = ollama.chat(
             model="llama3.1",
-            messages= [{"role": "system", "content": SYSTEM_PROMPT}, *st.session_state.history],
+            messages= [{"role": "system", "content": augmented_SYSTEM}, *st.session_state.history],
             tools=TOOLS
         )
 
