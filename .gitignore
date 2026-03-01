@@ -219,3 +219,5 @@ current_session.txt
 chroma_db/
 
 .python-version
+
+.env

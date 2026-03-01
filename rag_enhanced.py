@@ -11,6 +11,17 @@ from config import EMBEDDING_MODEL, CHROMA_PATH, COLLECTION_NAME
 
 from typing import List, Tuple
 
+import re
+
+_messages = None
+
+
+LOW_VALUE_EXACT = {
+    "ok", "okay", "okey", "tamam", "tm", "tmm", "k", "kk", "👍", "👌",
+    "lol", "lmao", "haha", "ahah", "hahaha", "evet", "aynen"
+}
+ONLY_EMOJI_RE = re.compile(r'^[\W_]+$')
+
 LINE_RE = re.compile(
     r'^\[(\d{1,2}\.\d{2}\.\d{4}), (\d{2}:\d{2}:\d{2})\] (.+?): (.+)$'
 )
@@ -87,6 +98,16 @@ def parse_whatsapp(filepath: str) -> list[dict]:
     messages.sort(key=lambda x: x["dt"])
     return messages
 
+def is_low_value(text: str) -> bool:
+    s = text.strip().lower()
+    if len(s) <= 2:
+        return True
+    if s in LOW_VALUE_EXACT:
+        return True
+    if ONLY_EMOJI_RE.match(s) and len(s) <= 6:
+        return True
+    return False
+
 def get_collection():
     client = chromadb.PersistentClient(path=CHROMA_PATH)
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -97,62 +118,136 @@ def get_collection():
         embedding_function=ef
     )
 
-def index_messages(messages: list[dict]):
+def index_messages(messages: list[dict], batch_size: int = 5000):
     collection = get_collection()
+    n = len(messages)
+    print(f"Indexing {n} messages...")
+    total_indexed = 0
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
 
-    
-    # Skip if already indexed
-    if collection.count() > 0:
-        print(f"Already indexed {collection.count()} chunks. Skipping.")
-        return
-    
-    ids = []
-    docs = []
-    metas = []
+        ids = []
+        docs = []
+        metas = []
+        
+        end = min(start + batch_size, n)
 
-    for i, msg in enumerate(messages):
-        # Make the doc text small and explicit
-        doc = f"{msg['sender']}: {msg['message']}"
-        ids.append(f"msg_{i}")
-        docs.append(doc)
-        metas.append({
-            "i": i,
-            "date": msg["date"],
-            "time": msg["time"],
-            "dt": msg["dt"].isoformat(),
-            "sender": msg["sender"],
-        })
+        for i in range(start, end):
+            text = messages[i]["message"]
 
-    print(f"Indexing {len(ids)} messages...")
-    collection.add(ids=ids, documents=docs, metadatas=metas)
+            # skip low-value messages
+            if is_low_value(text):
+                continue
+
+
+            ids.append(f"msg_{i}")  # keep original index
+            docs.append(f"{messages[i]['sender']}: {text}")
+            metas.append({
+                "i": i,  # IMPORTANT: keep original position for expansion
+                "date": messages[i]["date"],
+                "time": messages[i]["time"],
+                "dt": messages[i]["dt"].isoformat(),
+                "sender": messages[i]["sender"],
+            })
+
+        # upsert is safer than add
+        if ids:
+            collection.upsert(ids=ids, documents=docs, metadatas=metas)
+            total_indexed += len(ids)
+
+        if start == 0 or end == n or (start // batch_size) % 10 == 0:
+            print(f"  processed {end}/{n} | indexed so far: {total_indexed}")
+
     print("Indexing complete.")
 
-def retrieve(query: str, n_results: int = 3) -> str:
-    """
-    Finds the most relevant chat chunks for a given query.
-    Returns them as a single string to inject into the prompt.
-    """
+def _merge_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Merge overlapping (start,end) inclusive ranges."""
+    if not ranges:
+        return []
+    ranges = sorted(ranges, key=lambda x: x[0])
+    merged = [ranges[0]]
+    for s, e in ranges[1:]:
+        ps, pe = merged[-1]
+        if s <= pe + 1:
+            merged[-1] = (ps, max(pe, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+def get_messages():
+    global _messages
+    if _messages is None:
+        _messages = parse_whatsapp("elif_chat.txt")
+    return _messages
+
+def retrieve_with_expansion(
+    query: str,
+    top_k: int = 20,
+    window: int = 8,        # ±8 messages around each hit
+    max_windows: int = 4    # return at most 4 merged blocks
+) -> str:
     collection = get_collection()
-    
-    results = collection.query(
+    messages = get_messages()  
+    # Step 1: retrieve top_k hits
+    res = collection.query(
         query_texts=[query],
-        n_results=n_results
+        n_results=top_k
     )
-    
-    chunks = results["documents"][0]
-    dates = [m["date"] for m in results["metadatas"][0]]
-    
-    context = ""
-    for date, chunk in zip(dates, chunks):
-        context += f"\n--- {date} ---\n{chunk}\n"
-    
-    return context
+
+    res = collection.query(
+        query_texts=[query],
+        n_results=top_k
+    )
+
+    hit_metas = res["metadatas"][0]
+    hit_idxs = sorted({int(m["i"]) for m in hit_metas})  # unique indices
+
+     # Step 2: expand each hit into a range
+    ranges = []
+    n = len(messages)
+    for i in hit_idxs:
+        s = max(0, i - window)
+        e = min(n - 1, i + window)
+        ranges.append((s, e))
+
+    merged = _merge_ranges(ranges)
+
+     # Step 3: score windows (simple heuristic: how many hits inside)
+    hit_set = set(hit_idxs)
+    scored = []
+    for (s, e) in merged:
+        hit_count = sum(1 for j in range(s, e + 1) if j in hit_set)
+        length = (e - s + 1)
+        scored.append(((hit_count, -length), (s, e)))  # more hits, shorter is better
+
+    scored.sort(reverse=True)
+    best = [rng for _, rng in scored[:max_windows]]
+
+    # Step 4: build context text
+    blocks = []
+    for (s, e) in best:
+        start_dt = messages[s]["dt"].strftime("%d.%m.%Y %H:%M:%S")
+        end_dt = messages[e]["dt"].strftime("%d.%m.%Y %H:%M:%S")
+
+        lines = []
+        for j in range(s, e + 1):
+            m = messages[j]
+            # include time for readability
+            lines.append(f"[{m['date']} {m['time']}] {m['sender']}: {m['message']}")
+
+        blocks.append(
+            f"\n--- Context window ({start_dt} → {end_dt}) ---\n" + "\n".join(lines)
+        )
+
+    return "\n".join(blocks)
 
 
 if __name__ == "__main__":
     #messages = parse_whatsapp("elif_chat.txt")
+    #index_messages(messages)
+
     #chunks = chunk_by_day(messages)
     #print(f"Total messages: {len(messages)}")
     #print(f"Total chunks: {len(chunks)}")
     #index_chunks(chunks)
-    print(retrieve("deniz elif düğünü ne zaman?"))
+    print(retrieve_with_expansion("deniz elif düğünü ne zaman?"))
